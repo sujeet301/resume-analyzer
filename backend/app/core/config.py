@@ -14,9 +14,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
 
-    # Adzuna credentials (register at developer.adzuna.com).
-    adzuna_app_id: str = ""
-    adzuna_app_key: str = ""
+    # JWT signing secret: set a long random value in production.
+    jwt_secret: str = ""
+    access_token_expire_minutes: int = 60 * 24 * 7
 
     # Set false to use the deterministic fallback if model download is unavailable.
     enable_semantic_embeddings: bool = True

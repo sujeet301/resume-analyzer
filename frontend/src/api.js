@@ -5,6 +5,29 @@ const api = axios.create({
   timeout: 120000,
 });
 
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("resumeai_token");
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401 && localStorage.getItem("resumeai_token")) {
+      localStorage.removeItem("resumeai_token");
+      localStorage.removeItem("resumeai_user");
+      window.dispatchEvent(new Event("resumeai:logout"));
+    }
+    return Promise.reject(error);
+  }
+);
+
+export const registerUser = (name, email, password) => api.post("/auth/register", {name, email, password});
+export const loginUser = (email, password) => api.post("/auth/login", {email, password});
+export const getMe = () => api.get("/auth/me");
+export const deleteResume = (id) => api.delete(`/resumes/${id}`);
+
 export const uploadResume = (file) => {
   const body = new FormData();
   body.append("file", file);
@@ -14,7 +37,7 @@ export const getResumes = () => api.get("/resumes");
 export const getJobs = () => api.get("/jobs");
 export const seedJobs = () => api.post("/jobs/seed");
 export const getRecommendations = (id) => api.get(`/recommendations/${id}`);
-export const getLiveJobs = (id, params={}) => api.get(`/jobs/search-live/${id}`, {params});
+export const getLiveJobs = (id, params={}) => api.get(`/jobs/search-live/${id}`, {params:{...params, providers:"arbeitnow"}});
 export const getLinkedInLinks = (id, params={}) => api.get(`/jobs/linkedin-search/${id}`, {params});
 export const analyzeResume = (resume_id, job_id) => api.post("/analysis", {resume_id, job_id});
 export const aiResumeAnalysis = (resume_id, job_id=null) => api.post("/ai/resume-analysis", {resume_id, job_id});

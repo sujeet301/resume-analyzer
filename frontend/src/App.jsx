@@ -7,7 +7,8 @@ import {
   ChartNoAxesColumnIncreasing, Send, Play, FileUp, WandSparkles, ArrowUpRight
 } from "lucide-react";
 import {
-  uploadResume,getResumes,getJobs,seedJobs,getRecommendations,getLiveJobs,
+  uploadResume,getResumes,getJobs,seedJobs,getRecommendations,getLiveJobs,deleteResume,
+  registerUser,loginUser,getMe,
   getLinkedInLinks,aiResumeAnalysis,startInterview,submitAnswer,getInterview,
   resumeChat,getAIStatus
 } from "./api";
@@ -16,6 +17,13 @@ const cx=(...v)=>v.filter(Boolean).join(" ");
 const pct=(n)=>`${Math.max(0,Math.min(100,Number(n)||0))}%`;
 function App(){
   const [active,setActive]=useState("Resume Analysis");
+  const [authUser,setAuthUser]=useState(()=>{try{return localStorage.getItem("resumeai_token")?JSON.parse(localStorage.getItem("resumeai_user")||"null"):null}catch{return null}});
+  const [authMode,setAuthMode]=useState("login");
+  const [authName,setAuthName]=useState("");
+  const [authEmail,setAuthEmail]=useState("");
+  const [authPassword,setAuthPassword]=useState("");
+  const [authBusy,setAuthBusy]=useState(false);
+  const [authError,setAuthError]=useState("");
   const [resume,setResume]=useState(null),[resumes,setResumes]=useState([]);
   const [jobs,setJobs]=useState([]),[selectedJob,setSelectedJob]=useState("");
   const [recommendations,setRecommendations]=useState([]),[liveJobs,setLiveJobs]=useState([]);
@@ -24,6 +32,7 @@ function App(){
   const [questionIndex,setQuestionIndex]=useState(0),[answer,setAnswer]=useState("");
   const [feedback,setFeedback]=useState(null),[chatInput,setChatInput]=useState(""),[chatMessages,setChatMessages]=useState([]);
   const [tab,setTab]=useState("Summary"),[template,setTemplate]=useState("Classic");
+  const [editingSummary,setEditingSummary]=useState(false),[summaryDraft,setSummaryDraft]=useState("");
   const [location,setLocation]=useState("Delhi NCR"),[remote,setRemote]=useState(false);
   const [busy,setBusy]=useState(""),[error,setError]=useState(""),[notice,setNotice]=useState("");
   const [apiStatus,setApiStatus]=useState("checking"),[aiStatus,setAiStatus]=useState(false);
@@ -33,9 +42,33 @@ function App(){
   const selectedRecommendation=useMemo(()=>recommendations.find(x=>(x.job?.id||x.job?._id)===selectedJob),[recommendations,selectedJob]);
   const selectedJobObj=useMemo(()=>jobs.find(x=>(x.id||x._id)===selectedJob)||selectedRecommendation?.job,[jobs,selectedJob,selectedRecommendation]);
 
-  useEffect(()=>{refreshInitial();},[]);
+  useEffect(()=>{
+    const onLogout=()=>{setAuthUser(null);setResume(null);setResumes([]);setRecommendations([]);setJobs([]);};
+    window.addEventListener("resumeai:logout",onLogout);
+    if(localStorage.getItem("resumeai_token")){
+      getMe().then(r=>{setAuthUser(r.data);localStorage.setItem("resumeai_user",JSON.stringify(r.data));refreshInitial();})
+        .catch(()=>onLogout());
+    }
+    return ()=>window.removeEventListener("resumeai:logout",onLogout);
+  },[]);
+  async function submitAuth(e){
+    e.preventDefault();setAuthBusy(true);setAuthError("");
+    try{
+      const result=authMode==="login"?await loginUser(authEmail,authPassword):await registerUser(authName,authEmail,authPassword);
+      localStorage.setItem("resumeai_token",result.data.access_token);
+      localStorage.setItem("resumeai_user",JSON.stringify(result.data.user));
+      setAuthUser(result.data.user);setAuthPassword("");await refreshInitial();
+    }catch(err){setAuthError(err?.response?.data?.detail||err.message||"Could not authenticate.");}
+    finally{setAuthBusy(false);}
+  }
+  function logout(){
+    localStorage.removeItem("resumeai_token");localStorage.removeItem("resumeai_user");
+    setAuthUser(null);setResume(null);setResumes([]);setJobs([]);setRecommendations([]);setLiveJobs([]);
+    setAi(null);setInterview(null);setChatMessages([]);setActive("Resume Analysis");
+  }
   async function refreshInitial(){
     try{
+      if(!localStorage.getItem("resumeai_token"))return;
       const [r,j,s]=await Promise.all([getResumes(),getJobs(),getAIStatus()]);
       setResumes(r.data||[]);setJobs(j.data||[]);
       setAiStatus(Boolean(s.data?.gemini_configured));setApiStatus("connected");
@@ -50,13 +83,13 @@ function App(){
   async function loadRecommendations(id){
     const [rec,jobsRes]=await Promise.all([getRecommendations(id),getJobs()]);
     setRecommendations(rec.data||[]);setJobs(jobsRes.data||[]);
-    if(rec.data?.length&&!selectedJob)setSelectedJob(rec.data[0].job?.id||rec.data[0].job?._id||"");
+    if(rec.data?.length)setSelectedJob(rec.data[0].job?.id||rec.data[0].job?._id||"");
   }
   async function onUpload(file){
     if(!file)return;
     const result=await run("upload",async()=>{
       const r=await uploadResume(file);const item={id:r.data.resume_id,filename:r.data.filename,skills:r.data.skills,sections:r.data.sections,word_count:r.data.word_count};
-      setResume(item);setResumes(prev=>[item,...prev]);setAi(null);setInterview(null);setFeedback(null);
+      setResume(item);setResumes(prev=>[item,...prev]);setAi(null);setSummaryDraft("");setEditingSummary(false);setInterview(null);setFeedback(null);
       await loadRecommendations(item.id);setNotice("Resume uploaded and parsed successfully.");return r.data;
     });
     if(result)setActive("Resume Analysis");
@@ -71,10 +104,10 @@ function App(){
   async function searchLive(){
     if(!resume?.id)return setError("Upload a resume before searching for jobs.");
     const result=await run("live",async()=>{
-      const r=await getLiveJobs(resume.id,{location,country:"in",providers:"adzuna,arbeitnow",remote,limit:30});
+      const r=await getLiveJobs(resume.id,{location,country:"in",providers:"arbeitnow",remote,limit:30});
       const list=Array.isArray(r.data)?r.data:(r.data.jobs||r.data.results||[]);
       setLiveJobs(list);setActive("Job Recommendations");
-      if(!list.length)setNotice("No live listings returned. Check provider credentials and try a broader location or keyword.");
+      if(!list.length)setNotice("No live listings returned from Arbeitnow. Try a broader search or use the demo job catalogue.");
       return r.data;
     });
   }
@@ -103,7 +136,8 @@ function App(){
   const matched=selectedRecommendation?.matched_skills||recommendations[0]?.matched_skills||[];
   const missing=selectedRecommendation?.missing_skills||recommendations[0]?.missing_skills||[];
 
-  const nav=[{name:"Resume Analysis",icon:FileText},{name:"Job Recommendations",icon:BriefcaseBusiness},{name:"AI Resume Assistant",icon:Sparkles},{name:"Mock Interview",icon:MessageSquareText}];
+  const nav=[{name:"Resume Analysis",icon:FileText},{name:"Job Recommendations",icon:BriefcaseBusiness},{name:"AI Resume Assistant",icon:Sparkles},{name:"Mock Interview",icon:MessageSquareText},{name:"Settings",icon:Settings}];
+  if(!authUser)return <div className="auth-screen"><div className="auth-card"><div className="brand-mark auth-mark"><BrainCircuit size={24}/></div><div className="eyebrow">CAREER INTELLIGENCE PLATFORM</div><h1>{authMode==="login"?"Welcome back":"Create your account"}</h1><p>Sign in to keep your resumes, analysis and interview sessions private to your account.</p><form onSubmit={submitAuth}>{authMode==="register"&&<label className="field">Full name<input value={authName} onChange={e=>setAuthName(e.target.value)} required minLength={2} placeholder="Your name"/></label>}<label className="field">Email address<input type="email" value={authEmail} onChange={e=>setAuthEmail(e.target.value)} required placeholder="you@example.com"/></label><label className="field">Password<input type="password" value={authPassword} onChange={e=>setAuthPassword(e.target.value)} required minLength={8} placeholder="At least 8 characters"/></label>{authError&&<div className="alert alert-error">{authError}</div>}<button className="btn btn-primary full-btn" disabled={authBusy}>{authBusy?<LoaderCircle className="spin"/>:null}{authMode==="login"?"Sign in":"Create account"}</button></form><div className="auth-switch">{authMode==="login"?"New to ResumeAI?":"Already have an account?"} <button onClick={()=>{setAuthMode(authMode==="login"?"register":"login");setAuthError("");}}>{authMode==="login"?"Create account":"Sign in"}</button></div><small>Each account has its own private resume and interview records.</small></div></div>;
   return <div className="app-shell">
     <aside className={cx("sidebar",mobileNav&&"sidebar-open")}>
       <div className="brand"><div className="brand-mark"><BrainCircuit size={21}/></div><div><b>Resume<span>AI</span></b><small>CAREER INTELLIGENCE</small></div><button className="icon-btn mobile-close" onClick={()=>setMobileNav(false)}><X/></button></div>
@@ -111,13 +145,13 @@ function App(){
       <nav>{nav.map(n=><button key={n.name} className={cx("nav-item",active===n.name&&"active")} onClick={()=>{setActive(n.name);setMobileNav(false);}}><n.icon size={18}/><span>{n.name}</span>{n.name==="Job Recommendations"&&<span className="nav-count">{liveJobs.length||recommendations.length}</span>}</button>)}</nav>
       <div className="sidebar-bottom">
         <div className="plan-card"><div className="plan-icon"><Sparkles size={16}/></div><b>AI Career Toolkit</b><p>Make your next career move with clarity.</p><button onClick={()=>setActive("AI Resume Assistant")}>Explore AI tools <ArrowUpRight size={14}/></button></div>
-        <button className="nav-item"><Settings size={18}/>Settings</button>
-        <div className="user-mini"><div className="avatar">U</div><div><b>Candidate Workspace</b><small>Personal account</small></div><ChevronDown size={15}/></div>
+        <button className={cx("nav-item",active==="Settings"&&"active")} onClick={()=>setActive("Settings")}><Settings size={18}/>Settings</button>
+        <div className="user-mini"><div className="avatar">{(authUser?.name||"U").slice(0,1).toUpperCase()}</div><div><b>{authUser?.name||"Candidate"}</b><small>{authUser?.email||"Personal account"}</small></div><button className="text-btn" onClick={logout}>Log out</button></div>
       </div>
     </aside>
     {mobileNav&&<div className="mobile-scrim" onClick={()=>setMobileNav(false)}/>}
     <main className="main-area">
-      <header className="topbar"><div className="top-left"><button className="icon-btn mobile-menu" onClick={()=>setMobileNav(true)}><Menu/></button><div className="breadcrumb">Workspace <ChevronRight size={14}/> <b>{active}</b></div></div><div className="top-actions"><div className={cx("connection",apiStatus)}><i/>{apiStatus==="connected"?"API Connected":apiStatus==="checking"?"Connecting":"API Offline"}</div><button className="icon-btn notification"><Bell size={18}/><i/></button><div className="avatar">U</div></div></header>
+      <header className="topbar"><div className="top-left"><button className="icon-btn mobile-menu" onClick={()=>setMobileNav(true)}><Menu/></button><div className="breadcrumb">Workspace <ChevronRight size={14}/> <b>{active}</b></div></div><div className="top-actions"><div className={cx("connection",apiStatus)}><i/>{apiStatus==="connected"?"API Connected":apiStatus==="checking"?"Connecting":"API Offline"}</div><button className="icon-btn notification"><Bell size={18}/><i/></button><div className="avatar">{(authUser?.name||"U").slice(0,1).toUpperCase()}</div><button className="btn btn-light btn-small" onClick={logout}>Log out</button></div></header>
       <div className="page-content">
         <div className="page-heading"><div><div className="eyebrow">CAREER INTELLIGENCE PLATFORM</div><h1>{active==="Resume Analysis"?"Resume Dashboard":active}</h1><p>{active==="Resume Analysis"?"Optimize your resume and understand how it aligns with your target roles.":active==="Job Recommendations"?"Discover relevant opportunities ranked against your resume.":active==="AI Resume Assistant"?"Get personalized, evidence-based feedback from your AI career assistant.":"Practice role-specific interviews and improve your answers."}</p></div><div className="heading-actions"><button className="btn btn-light" onClick={()=>fileRef.current?.click()}><UploadCloud size={16}/> Upload resume</button><button className="btn btn-primary" disabled={!resume||!!busy} onClick={optimize}>{busy==="optimize"?<LoaderCircle className="spin" size={16}/>:<Sparkles size={16}/>} Optimize with AI</button></div></div>
         {error&&<div className="alert alert-error"><AlertCircle size={17}/><span>{error}</span><button onClick={()=>setError("")}><X size={16}/></button></div>}
@@ -126,12 +160,12 @@ function App(){
         {!resume&&<div className="empty-upload"><div className="upload-symbol"><FileUp size={30}/></div><h2>Start with your resume</h2><p>Upload a PDF or DOCX file to extract your skills, analyze your profile, and find matching jobs.</p><button className="btn btn-primary" onClick={()=>fileRef.current?.click()}><UploadCloud size={17}/> Choose resume</button><small>PDF or DOCX · Maximum 10 MB</small></div>}
         {resume&&active==="Resume Analysis"&&<div className="dashboard-grid">
           <section className="panel editor-panel">
-            <div className="panel-header"><div className="panel-title"><FileText size={17}/><b>Current Resume Analysis</b><span className="file-tag">{resume.filename||"Uploaded resume"}</span></div><div className="panel-actions"><button className="text-btn" onClick={()=>{setAi(null);setTab("Summary");}}>Start over</button></div></div>
-            <div className="resume-toolbar"><div className="resume-file"><div className="file-icon"><FileText size={17}/></div><div><b>{resume.filename||"Resume"}</b><small>{resume.word_count?`${resume.word_count} words`:"Resume uploaded"}</small></div></div><div className="toolbar-buttons"><button className="btn btn-small btn-light" onClick={()=>window.print()}><Eye size={14}/> Preview</button><button className="btn btn-small btn-primary" onClick={()=>window.print()}><Download size={14}/> Download PDF</button></div></div>
+            <div className="panel-header"><div className="panel-title"><FileText size={17}/><b>Current Resume Analysis</b><span className="file-tag">{resume.filename||"Uploaded resume"}</span>{resumes.length>1&&<select className="resume-switcher" value={resume.id} onChange={async e=>{const chosen=resumes.find(x=>x.id===e.target.value);if(chosen){setResume(chosen);setAi(null);setInterview(null);await loadRecommendations(chosen.id);}}}>{resumes.map(x=><option key={x.id} value={x.id}>{x.filename}</option>)}</select>}</div><div className="panel-actions"><button className="text-btn" onClick={()=>{setAi(null);setInterview(null);setFeedback(null);setChatMessages([]);setTab("Summary");setNotice("Analysis workspace reset. Your uploaded resume is still saved.");}}>Start over</button></div></div>
+            <div className="resume-toolbar"><div className="resume-file"><div className="file-icon"><FileText size={17}/></div><div><b>{resume.filename||"Resume"}</b><small>{resume.word_count?`${resume.word_count} words`:"Resume uploaded"}</small></div></div><div className="toolbar-buttons"><button className="btn btn-small btn-light" onClick={()=>window.print()}><Eye size={14}/> Preview</button><button className="btn btn-small btn-primary" onClick={()=>window.print()}><Download size={14}/> Print / Save PDF</button><button className="btn btn-small btn-light" onClick={()=>run("delete",async()=>{if(!window.confirm("Delete this resume and its related analysis/interview history?"))return;await deleteResume(resume.id);setResume(null);setResumes(x=>x.filter(v=>v.id!==resume.id));setRecommendations([]);setAi(null);setInterview(null);setNotice("Resume deleted.");})}><Trash2 size={14}/> Delete</button></div></div>
             <div className="section-label">Template style</div><div className="template-grid">{[{name:"Classic",desc:"Traditional layout with clear sections"},{name:"Modern",desc:"Contemporary design with side column"},{name:"Professional",desc:"Clean format with horizontal dividers"}].map(t=><button key={t.name} className={cx("template-card",template===t.name&&"selected")} onClick={()=>setTemplate(t.name)}><span className="template-doc"><FileText size={16}/></span><span><b>{t.name}</b><small>{t.desc}</small></span>{template===t.name&&<span className="template-check"><Check size={12}/></span>}</button>)}</div>
             <div className="tabs">{["Summary","Skills","Experience","Education"].map(t=><button key={t} className={cx("tab",tab===t&&"active")} onClick={()=>setTab(t)}>{t}</button>)}</div>
             <div className="editor-content">
-              {tab==="Summary"&&<><div className="editor-title">AI professional summary</div>{ai?.professional_summary?<div className="ai-summary">{ai.professional_summary}</div>:<div className="soft-placeholder">Your AI-generated professional summary will appear here after you select <b>Optimize with AI</b>.</div>}<p className="helper-text">Review every statement to ensure it accurately reflects your experience.</p>{ai?.strengths?.length>0&&<div className="inline-list"><b>Key strengths</b>{ai.strengths.map((s,i)=><div key={i}><Check size={14}/>{s}</div>)}</div>}</>}
+              {tab==="Summary"&&<><div className="editor-title">AI professional summary</div>{ai?.professional_summary?<>{editingSummary?<textarea className="summary-editor" rows={5} value={summaryDraft} onChange={e=>setSummaryDraft(e.target.value)}/>:<div className="ai-summary">{summaryDraft||ai.professional_summary}</div>}<button className="btn btn-light btn-small summary-edit" onClick={()=>{if(editingSummary){setSummaryDraft(summaryDraft.trim());setEditingSummary(false);setNotice("Edited summary saved in this browser session.");}else{setSummaryDraft(summaryDraft||ai.professional_summary);setEditingSummary(true);}}}>{editingSummary?"Save edited summary":"Edit summary"} <Pencil size={13}/></button></>:<div className="soft-placeholder">Your AI-generated professional summary will appear here after you select <b>Optimize with AI</b>.</div>}<p className="helper-text">Review every statement to ensure it accurately reflects your experience.</p>{ai?.strengths?.length>0&&<div className="inline-list"><b>Key strengths</b>{ai.strengths.map((s,i)=><div key={i}><Check size={14}/>{s}</div>)}</div>}</>}
               {tab==="Skills"&&<><div className="editor-title">Detected skills</div><div className="skill-cloud">{skills.length?skills.map(s=><span key={s} className="skill-pill">{s}</span>):<span className="soft-placeholder">No skills detected.</span>}</div><p className="helper-text">Skills are extracted from your resume text. Check for missing or incorrectly detected skills.</p></>}
               {tab==="Experience"&&<SectionView lines={resume.sections?.experience} empty="No experience section was detected in this resume."/>}
               {tab==="Education"&&<SectionView lines={resume.sections?.education} empty="No education section was detected in this resume."/>}
@@ -151,14 +185,15 @@ function App(){
           </aside>
         </div>}
         {resume&&active==="Job Recommendations"&&<div className="content-stack">
-          <section className="filter-panel"><div className="filter-heading"><div><h2>Find jobs that fit your profile</h2><p>Search providers and rank available roles against your resume.</p></div><button className="btn btn-light" onClick={loadLinkedIn}><ExternalLink size={15}/> LinkedIn searches</button></div><div className="filters"><label className="field">Location<input value={location} onChange={e=>setLocation(e.target.value)} placeholder="e.g. Delhi NCR"/></label><label className="checkbox-field"><input type="checkbox" checked={remote} onChange={e=>setRemote(e.target.checked)}/> Remote only</label><button className="btn btn-primary" disabled={!!busy} onClick={searchLive}>{busy==="live"?<LoaderCircle className="spin" size={16}/>:<Search size={16}/>} Search live jobs</button><button className="btn btn-light" onClick={()=>run("seed",async()=>{await seedJobs();await loadRecommendations(resume.id);setNotice("Demo jobs refreshed.");})}>Load demo jobs</button></div></section>
+          <section className="filter-panel"><div className="filter-heading"><div><h2>Find jobs that fit your profile</h2><p>Search Arbeitnow listings and rank available roles against your resume.</p></div><button className="btn btn-light" onClick={loadLinkedIn}><ExternalLink size={15}/> LinkedIn searches</button></div><div className="filters"><label className="field">Location<input value={location} onChange={e=>setLocation(e.target.value)} placeholder="e.g. Delhi NCR"/></label><label className="checkbox-field"><input type="checkbox" checked={remote} onChange={e=>setRemote(e.target.checked)}/> Remote only</label><button className="btn btn-primary" disabled={!!busy} onClick={searchLive}>{busy==="live"?<LoaderCircle className="spin" size={16}/>:<Search size={16}/>} Search live jobs</button><button className="btn btn-light" onClick={()=>run("seed",async()=>{await seedJobs();await loadRecommendations(resume.id);setNotice("Demo jobs refreshed.");})}>Load demo jobs</button></div></section>
           {linkedin.length>0&&<section className="panel link-panel"><div className="panel-header"><div className="panel-title"><ExternalLink size={17}/><b>Personalized LinkedIn searches</b></div><button className="text-btn" onClick={()=>setLinkedin([])}>Hide</button></div><div className="linkedin-links">{linkedin.map((l,i)=><a key={i} href={l.url} target="_blank" rel="noreferrer">{l.label}<ExternalLink size={13}/></a>)}</div></section>}
-          <div className="results-heading"><div><h2>Recommended opportunities</h2><p>{liveJobs.length?`${liveJobs.length} live listings returned by providers`:`${recommendations.length} jobs ranked from your available job database`}</p></div><span className="source-chip">{liveJobs.length?"Live provider results":"Saved/demo jobs"}</span></div>
+          <div className="results-heading"><div><h2>Recommended opportunities</h2><p>{liveJobs.length?`${liveJobs.length} live listings returned by Arbeitnow`:`${recommendations.length} jobs ranked from your available job database`}</p></div><span className="source-chip">{liveJobs.length?"Live provider results":"Saved/demo jobs"}</span></div>
           {(liveJobs.length?liveJobs:recommendations).length===0?<div className="empty-state"><BriefcaseBusiness size={26}/><b>No job results yet</b><p>Try loading demo jobs or search live providers after configuring your API credentials.</p></div>:
             (liveJobs.length?liveJobs:recommendations).map((item,i)=><JobCard key={item.id||item.job?.id||item.job?.url||i} item={item} live={!!liveJobs.length} onSelect={()=>{const j=item.job||item;const id=j.id||j._id;if(id){setSelectedJob(id);setActive("Resume Analysis");}}}/>)}
         </div>}
         {resume&&active==="AI Resume Assistant"&&<div className="assistant-layout"><section className="panel assistant-main"><div className="assistant-intro"><div className="assistant-icon"><Sparkles/></div><div><h2>Resume AI Assistant</h2><p>Ask questions about your resume, skills, or target role. Responses are grounded in your uploaded resume.</p></div></div><div className="chat-area">{chatMessages.length===0&&<div className="suggested-prompts"><b>Try asking</b>{["What are the biggest weaknesses in my resume?","How can I improve my professional summary?","Which skills should I learn for my target role?"].map(q=><button key={q} onClick={()=>setChatInput(q)}>{q}<ChevronRight size={14}/></button>)}</div>}{chatMessages.map((m,i)=><div key={i} className={cx("chat-message",m.role)}><div className="chat-avatar">{m.role==="assistant"?<Sparkles size={15}/>:<UserRound size={15}/>}</div><div>{m.text}</div></div>)}</div><form className="chat-composer" onSubmit={sendChat}><input value={chatInput} onChange={e=>setChatInput(e.target.value)} placeholder="Ask something about your resume..."/><button className="btn btn-primary" disabled={!!busy||!chatInput.trim()}><Send size={16}/></button></form></section><aside className="panel assistant-side"><h3>AI review</h3>{ai? <><b>{ai.strengths?.length||0} strengths identified</b><p>{ai.target_role_fit}</p><button className="btn btn-light full-btn" onClick={()=>setActive("Resume Analysis")}>View full review</button></>:<><p>Run an AI resume review to get a detailed assessment before chatting.</p><button className="btn btn-primary full-btn" disabled={!!busy} onClick={optimize}><Sparkles size={15}/> Analyze my resume</button></>}</aside></div>}
         {resume&&active==="Mock Interview"&&<div className="interview-layout"><section className="panel interview-panel"><div className="panel-header"><div className="panel-title"><MessageSquareText size={17}/><b>AI Mock Interview</b></div>{interview&&<span className="source-chip">{interview.job_title}</span>}</div>{!interview?<div className="interview-start"><div className="interview-art"><BrainCircuit size={34}/></div><h2>Practice before the real interview</h2><p>Generate questions tailored to your resume and selected job. Submit each answer for AI feedback and an improvement plan.</p><label className="field">Target job<select value={selectedJob} onChange={e=>setSelectedJob(e.target.value)}><option value="">Choose a job</option>{recommendations.map(r=><option key={r.job?.id||r.job?._id} value={r.job?.id||r.job?._id}>{r.job?.title} · {r.job?.company}</option>)}{jobs.map(j=><option key={j.id||j._id} value={j.id||j._id}>{j.title} · {j.company}</option>)}</select></label><button className="btn btn-primary" disabled={!!busy} onClick={beginInterview}>{busy==="interview"?<LoaderCircle className="spin"/>:<Play size={16}/>} Generate interview questions</button></div>:<div className="interview-body"><div className="question-progress"><span>QUESTION {questionIndex+1} OF {interview.questions.length}</span><div className="progress-track"><i style={{width:`${((questionIndex+1)/interview.questions.length)*100}%`}}/></div></div><div className="question-type">{interview.questions[questionIndex]?.type||"Interview question"}</div><h2>{interview.questions[questionIndex]?.question}</h2><textarea value={answer} onChange={e=>setAnswer(e.target.value)} placeholder="Structure your answer with a specific example..." rows={7}/><div className="answer-actions"><button className="btn btn-primary" disabled={!!busy||answer.trim().length<5} onClick={evaluateAnswer}>{busy==="evaluate"?<LoaderCircle className="spin"/>:<Sparkles size={16}/>} Evaluate answer</button>{questionIndex<interview.questions.length-1&&<button className="btn btn-light" onClick={()=>{setQuestionIndex(i=>i+1);setAnswer("");setFeedback(null);}}>Next question <ChevronRight size={15}/></button>}</div>{feedback&&<div className="feedback-card"><div className="feedback-score"><div><small>ANSWER SCORE</small><b>{feedback.score}/100</b></div><span>{feedback.verdict?.replace("_"," ")}</span></div><h4>What went well</h4>{(feedback.what_was_good||[]).map((x,i)=><p key={i}><Check size={14}/>{x}</p>)}<h4>What to improve</h4>{(feedback.what_to_improve||[]).map((x,i)=><p key={i}><Target size={14}/>{x}</p>)}{feedback.sample_improved_answer&&<><h4>Example improved answer</h4><blockquote>{feedback.sample_improved_answer}</blockquote></>}</div>}</div>}</section><aside className="panel interview-tips"><h3>Interview tips</h3><div><b>Use STAR</b><p>Situation, Task, Action, Result. Explain the context, your responsibility, what you did, and the outcome.</p></div><div><b>Be specific</b><p>Describe your own contribution and the tools or decisions you used.</p></div><div><b>Stay truthful</b><p>Do not claim experience or results you cannot support.</p></div></aside></div>}
+        {active==="Settings"&&<section className="panel settings-panel"><div className="panel-title"><Settings size={18}/><b>Account settings</b></div><div className="settings-user"><div className="avatar large-avatar">{(authUser?.name||"U").slice(0,1).toUpperCase()}</div><div><h2>{authUser?.name}</h2><p>{authUser?.email}</p></div></div><div className="settings-row"><div><b>Account security</b><p>Password is stored as a salted scrypt hash. Sessions use signed access tokens.</p></div></div><div className="settings-row"><div><b>Personal data</b><p>Your uploaded resumes and interview sessions are scoped to your account. Delete a resume from the dashboard to remove its associated analysis and interview records.</p></div></div><button className="btn btn-light" onClick={logout}>Sign out</button></section>}
         <footer className="footer"><span>ResumeAI · AI-assisted career preparation</span><span>AI suggestions can be inaccurate. Verify before using.</span></footer>
       </div>
     </main>

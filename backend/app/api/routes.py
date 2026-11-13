@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from bson import ObjectId
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from app.core.config import settings
 from app.db.mongo import get_database
 from app.models.schemas import (
@@ -12,13 +12,14 @@ from app.services.resume_parser import extract_text
 from app.services.analyzer import extract_skills, extract_sections, improvement_suggestions
 from app.services.matching import match_resume_to_job
 from app.services.ai_client import gemini_configured
-from app.services.job_providers import search_adzuna, search_arbeitnow
+from app.services.job_providers import search_arbeitnow
+from app.core.auth import current_user_id, require_user
 from app.services.ai_features import (
     analyze_resume_with_ai, create_interview_questions,
     evaluate_interview_answer, generate_resume_chat_reply
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 def oid(value: str, label: str):
     if not ObjectId.is_valid(value):
@@ -43,13 +44,13 @@ def linkedin_jobs_url(keywords: str, location: str = "", remote: bool = False) -
 
 async def get_resume_or_404(resume_id: str, include_text: bool = True):
     projection = None if include_text else {"text": 0}
-    doc = await get_database().resumes.find_one({"_id": oid(resume_id, "resume")}, projection)
+    doc = await get_database().resumes.find_one({"_id": oid(resume_id, "resume"), "user_id": current_user_id()}, projection)
     if not doc:
         raise HTTPException(404, "Resume not found")
     return doc
 
 async def get_job_or_404(job_id: str):
-    doc = await get_database().jobs.find_one({"_id": oid(job_id, "job")})
+    doc = await get_database().jobs.find_one({"_id": oid(job_id, "job"), "$or": [{"user_id": current_user_id()}, {"is_global": True}]})
     if not doc:
         raise HTTPException(404, "Job not found")
     return doc
@@ -89,6 +90,7 @@ async def upload_resume(file: UploadFile = File(...)):
     skills = extract_skills(text)
     sections = extract_sections(text)
     doc = {
+        "user_id": current_user_id(),
         "filename": file.filename,
         "content_type": file.content_type,
         "text": text,
@@ -108,7 +110,7 @@ async def upload_resume(file: UploadFile = File(...)):
 
 @router.get("/resumes")
 async def list_resumes():
-    docs = await get_database().resumes.find({}, {"text": 0}).sort("created_at", -1).to_list(100)
+    docs = await get_database().resumes.find({"user_id": current_user_id()}, {"text": 0}).sort("created_at", -1).to_list(100)
     return [serialize(d) for d in docs]
 
 @router.get("/resumes/{resume_id}")
@@ -119,23 +121,25 @@ async def get_resume(resume_id: str):
 async def delete_resume(resume_id: str):
     db = get_database()
     rid = oid(resume_id, "resume")
-    result = await db.resumes.delete_one({"_id": rid})
+    result = await db.resumes.delete_one({"_id": rid, "user_id": current_user_id()})
     if not result.deleted_count:
         raise HTTPException(404, "Resume not found")
-    await db.analyses.delete_many({"resume_id": resume_id})
-    await db.interviews.delete_many({"resume_id": resume_id})
+    await db.analyses.delete_many({"resume_id": resume_id, "user_id": current_user_id()})
+    await db.ai_analyses.delete_many({"resume_id": resume_id, "user_id": current_user_id()})
+    await db.interviews.delete_many({"resume_id": resume_id, "user_id": current_user_id()})
     return {"message": "Resume and related analysis/interview records deleted"}
 
 @router.post("/jobs")
 async def create_job(payload: JobCreate):
     doc = payload.model_dump()
+    doc["user_id"] = current_user_id()
     doc["created_at"] = datetime.now(timezone.utc)
     result = await get_database().jobs.insert_one(doc)
     return {"job_id": str(result.inserted_id), **payload.model_dump()}
 
 @router.get("/jobs")
 async def list_jobs():
-    docs = await get_database().jobs.find({}).sort("created_at", -1).to_list(200)
+    docs = await get_database().jobs.find({"$or": [{"user_id": current_user_id()}, {"is_global": True}]}).sort("created_at", -1).to_list(200)
     return [serialize(d) for d in docs]
 
 @router.post("/jobs/seed")
@@ -150,8 +154,8 @@ async def seed_jobs():
     ]
     inserted = 0
     for job in samples:
-        if not await db.jobs.find_one({"title": job["title"], "company": job["company"]}):
-            await db.jobs.insert_one({**job, "created_at": datetime.now(timezone.utc)})
+        if not await db.jobs.find_one({"title": job["title"], "company": job["company"], "is_global": True}):
+            await db.jobs.insert_one({**job, "is_global": True, "created_at": datetime.now(timezone.utc)})
             inserted += 1
     return {"message": f"Seeded {inserted} demo jobs", "inserted": inserted}
 
@@ -163,6 +167,7 @@ async def analyze_resume(payload: AnalyzeRequest):
     result = match_resume_to_job(resume, job)
     result.update({
         "resume_id": payload.resume_id,
+        "user_id": current_user_id(),
         "job_id": payload.job_id,
         "job_title": job["title"],
         "company": job["company"],
@@ -176,7 +181,7 @@ async def analyze_resume(payload: AnalyzeRequest):
 @router.get("/recommendations/{resume_id}")
 async def recommendations(resume_id: str):
     resume = await get_resume_or_404(resume_id)
-    jobs = await get_database().jobs.find({}).to_list(200)
+    jobs = await get_database().jobs.find({"$or": [{"user_id": current_user_id()}, {"is_global": True}]}).to_list(200)
     results = []
     for job in jobs:
         match = match_resume_to_job(resume, job)
@@ -205,7 +210,7 @@ async def search_live_jobs(
     location: str = "",
     country: str = "in",
     query: str = "",
-    providers: str = "adzuna,arbeitnow",
+    providers: str = "arbeitnow",
     remote: bool = False,
     page: int = 1,
     limit: int = 20,
@@ -219,16 +224,11 @@ async def search_live_jobs(
     skills = resume.get("skills", [])
     search_query = query.strip() or " ".join(skills[:4]) or "software developer"
     selected = {p.strip().lower() for p in providers.split(",") if p.strip()}
-    unknown = selected - {"adzuna", "arbeitnow"}
+    unknown = selected - {"arbeitnow"}
     if unknown:
         raise HTTPException(400, f"Unknown providers: {', '.join(sorted(unknown))}")
 
     jobs, provider_errors = [], []
-    if "adzuna" in selected:
-        try:
-            jobs.extend(await search_adzuna(search_query, location, country, page, limit))
-        except Exception as exc:
-            provider_errors.append({"provider": "Adzuna", "error": str(exc)})
     if "arbeitnow" in selected:
         try:
             jobs.extend(await search_arbeitnow(search_query, location, remote, page))
@@ -276,7 +276,6 @@ async def search_live_jobs(
         "results": ranked,
         "provider_errors": provider_errors,
         "attribution": [
-            {"provider": "Adzuna", "label": "Jobs by Adzuna", "url": "https://www.adzuna.in/"},
             {"provider": "Arbeitnow", "label": "Jobs from Arbeitnow", "url": "https://www.arbeitnow.com/"},
         ],
         "notice": "Listings and apply links are supplied by the job sources. Verify availability and details on the source site. Match scores are relevance estimates, not hiring probabilities."
@@ -319,6 +318,7 @@ async def ai_resume_analysis(payload: ResumeAIRequest):
     except Exception as exc:
         raise HTTPException(502, f"AI analysis failed: {exc}")
     result["resume_id"] = payload.resume_id
+    result["user_id"] = current_user_id()
     result["job_id"] = payload.job_id
     result["created_at"] = datetime.now(timezone.utc)
     saved = await get_database().ai_analyses.insert_one(result)
@@ -341,6 +341,7 @@ async def start_interview(payload: InterviewStartRequest):
         raise HTTPException(502, "AI returned no interview questions")
     doc = {
         "resume_id": payload.resume_id,
+        "user_id": current_user_id(),
         "job_id": payload.job_id,
         "job_title": job["title"],
         "questions": questions,
@@ -360,7 +361,7 @@ async def submit_interview_answer(payload: InterviewAnswerRequest):
         raise HTTPException(503, "Gemini is not configured. Add GEMINI_API_KEY to .env and restart the API.")
     db = get_database()
     iid = oid(payload.interview_id, "interview")
-    interview = await db.interviews.find_one({"_id": iid})
+    interview = await db.interviews.find_one({"_id": iid, "user_id": current_user_id()})
     if not interview:
         raise HTTPException(404, "Interview session not found")
     questions = interview.get("questions", [])
@@ -378,12 +379,12 @@ async def submit_interview_answer(payload: InterviewAnswerRequest):
         "feedback": feedback,
         "created_at": datetime.now(timezone.utc)
     }
-    await db.interviews.update_one({"_id": iid}, {"$push": {"answers": answer_record}})
+    await db.interviews.update_one({"_id": iid, "user_id": current_user_id()}, {"$push": {"answers": answer_record}})
     return answer_record
 
 @router.get("/ai/interviews/{interview_id}")
 async def get_interview(interview_id: str):
-    doc = await get_database().interviews.find_one({"_id": oid(interview_id, "interview")})
+    doc = await get_database().interviews.find_one({"_id": oid(interview_id, "interview"), "user_id": current_user_id()})
     if not doc:
         raise HTTPException(404, "Interview session not found")
     return serialize(doc)
